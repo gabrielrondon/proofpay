@@ -1,11 +1,15 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-/// x402 payment verification via Stellar facilitator.
+use crate::config::Config;
+
+/// x402 payment verification.
 ///
-/// The x402 protocol uses HTTP 402 Payment Required to gate access.
-/// A facilitator verifies and settles payments on-chain.
-
-const FACILITATOR_URL: &str = "https://channels.openzeppelin.com/x402/testnet";
+/// The x402 protocol uses HTTP 402 Payment Required to gate access to a
+/// resource: the server advertises payment requirements, the client settles
+/// on-chain, and a facilitator verifies the settlement. ProofPay delegates
+/// verification to a configurable facilitator endpoint so it can target any
+/// Stellar-compatible x402 facilitator.
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PaymentRequirement {
@@ -25,26 +29,46 @@ pub struct PaymentVerification {
     pub error: Option<String>,
 }
 
-/// Build a 402 Payment Required response with x402 headers.
-pub fn payment_required_response(description: &str, amount: &str, recipient: &str) -> PaymentRequirement {
+/// Build the payment requirements advertised in a 402 response.
+pub fn payment_required_response(config: &Config) -> PaymentRequirement {
     PaymentRequirement {
-        network: "stellar:testnet".to_string(),
-        amount: amount.to_string(),
-        asset: "native".to_string(), // XLM
-        recipient: recipient.to_string(),
-        description: description.to_string(),
+        network: config.network.clone(),
+        amount: config.amount_stroops.clone(),
+        asset: config.asset.clone(),
+        recipient: config.recipient.clone(),
+        description: config.access_description.clone(),
     }
 }
 
-/// Verify an x402 payment header against the facilitator.
-pub async fn verify_payment(payment_header: &str) -> PaymentVerification {
+/// Verify an x402 payment header.
+///
+/// In mock mode (`X402_MOCK=true`), any non-empty header is accepted — useful
+/// for local demos and for the bundled example agent. In non-mock mode the
+/// header is forwarded to the configured facilitator for real settlement
+/// verification.
+pub async fn verify_payment(config: &Config, payment_header: &str) -> PaymentVerification {
+    if payment_header.trim().is_empty() {
+        return PaymentVerification {
+            valid: false,
+            tx_hash: None,
+            error: Some("Empty X-Payment header".into()),
+        };
+    }
+
+    if config.mock_payments {
+        return PaymentVerification {
+            valid: true,
+            tx_hash: Some(format!("mock-{}", Uuid::new_v4())),
+            error: None,
+        };
+    }
+
     let client = reqwest::Client::new();
+    let url = format!("{}/verify", config.facilitator_url.trim_end_matches('/'));
 
     match client
-        .post(format!("{}/verify", FACILITATOR_URL))
-        .json(&serde_json::json!({
-            "payment": payment_header,
-        }))
+        .post(&url)
+        .json(&serde_json::json!({ "payment": payment_header }))
         .send()
         .await
     {
@@ -53,7 +77,10 @@ pub async fn verify_payment(payment_header: &str) -> PaymentVerification {
                 match resp.json::<serde_json::Value>().await {
                     Ok(body) => PaymentVerification {
                         valid: body.get("valid").and_then(|v| v.as_bool()).unwrap_or(false),
-                        tx_hash: body.get("txHash").and_then(|v| v.as_str()).map(String::from),
+                        tx_hash: body
+                            .get("txHash")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                         error: None,
                     },
                     Err(e) => PaymentVerification {
@@ -67,48 +94,6 @@ pub async fn verify_payment(payment_header: &str) -> PaymentVerification {
                     valid: false,
                     tx_hash: None,
                     error: Some(format!("Facilitator returned {}", resp.status())),
-                }
-            }
-        }
-        Err(e) => PaymentVerification {
-            valid: false,
-            tx_hash: None,
-            error: Some(format!("Failed to reach facilitator: {e}")),
-        },
-    }
-}
-
-/// Settle an x402 payment via the facilitator.
-pub async fn settle_payment(payment_header: &str) -> PaymentVerification {
-    let client = reqwest::Client::new();
-
-    match client
-        .post(format!("{}/settle", FACILITATOR_URL))
-        .json(&serde_json::json!({
-            "payment": payment_header,
-        }))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(body) => PaymentVerification {
-                        valid: true,
-                        tx_hash: body.get("txHash").and_then(|v| v.as_str()).map(String::from),
-                        error: None,
-                    },
-                    Err(e) => PaymentVerification {
-                        valid: false,
-                        tx_hash: None,
-                        error: Some(format!("Failed to parse settle response: {e}")),
-                    },
-                }
-            } else {
-                PaymentVerification {
-                    valid: false,
-                    tx_hash: None,
-                    error: Some(format!("Settle returned {}", resp.status())),
                 }
             }
         }

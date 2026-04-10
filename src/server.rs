@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use axum::{
     Router,
-    extract::Json,
+    extract::{Json, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -9,30 +11,17 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
-use crate::proof::{self, CommitmentProof, VerificationResult};
+use crate::config::Config;
+use crate::proof::{self, CommitmentProof};
 use crate::x402;
 
-/// Access token issued after successful proof verification + payment
-#[derive(Debug, Serialize)]
-struct AccessToken {
-    token: String,
-    resource: String,
-    expires_in: u64,
-}
-
-/// Request to verify a proof and get a payment requirement
+/// Request body for `/verify` and `/access`.
 #[derive(Debug, Deserialize)]
-struct VerifyRequest {
+struct ProofRequest {
     proof: CommitmentProof,
 }
 
-/// Request to access a gated resource with proof + payment
-#[derive(Debug, Deserialize)]
-struct AccessRequest {
-    proof: CommitmentProof,
-}
-
-/// Protected resource content
+/// Protected resource returned after a successful proof + payment.
 #[derive(Debug, Serialize)]
 struct ProtectedResource {
     id: String,
@@ -41,72 +30,76 @@ struct ProtectedResource {
     payment_status: String,
 }
 
-pub fn create_router() -> Router {
+pub fn create_router(config: Arc<Config>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/verify", post(verify_proof))
         .route("/access", post(access_resource))
         .route("/payment-info", get(payment_info))
+        .with_state(config)
         .layer(CorsLayer::permissive())
 }
 
-async fn index() -> impl IntoResponse {
+async fn index(State(cfg): State<Arc<Config>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "name": "ProofPay",
-        "description": "ZK-gated payments on Stellar — prove access rights with zero-knowledge proofs, pay via x402",
-        "version": "0.1.0",
+        "description": "ZK-gated x402 access for autonomous agents on Stellar",
+        "version": env!("CARGO_PKG_VERSION"),
+        "network": cfg.network,
         "endpoints": {
             "POST /verify": "Verify a ZK commitment proof",
-            "POST /access": "Access a protected resource (requires valid proof + x402 payment)",
+            "POST /access": "Access a gated resource (requires valid proof + x402 payment)",
             "GET /payment-info": "Get x402 payment requirements",
             "GET /health": "Health check"
         },
         "flow": [
-            "1. Generate a commitment proof (hash your secret, sign with Ed25519)",
-            "2. POST /verify to check your proof is valid",
-            "3. POST /access with your proof + X-Payment header (x402) to access the resource",
-            "4. If proof is valid and payment is verified, you get the protected content"
+            "1. Agent generates a commitment proof (SHA-256 of a secret credential, signed with Ed25519)",
+            "2. POST /verify to check the proof is accepted",
+            "3. POST /access without payment returns HTTP 402 with x402 requirements",
+            "4. Agent builds an X-Payment header from a Stellar payment and retries",
+            "5. Server verifies proof + payment and returns the gated content"
         ]
     }))
 }
 
-async fn health() -> impl IntoResponse {
+async fn health(State(cfg): State<Arc<Config>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "service": "proofpay",
-        "network": "stellar:testnet"
+        "network": cfg.network,
+        "mock_payments": cfg.mock_payments
     }))
 }
 
 /// Verify a ZK commitment proof without requiring payment.
-/// Use this to check if your proof is valid before paying.
-async fn verify_proof(Json(req): Json<VerifyRequest>) -> impl IntoResponse {
+async fn verify_proof(
+    State(_cfg): State<Arc<Config>>,
+    Json(req): Json<ProofRequest>,
+) -> impl IntoResponse {
     let result = proof::verify_commitment(&req.proof);
 
-    if result.valid {
-        (StatusCode::OK, Json(serde_json::to_value(result).unwrap()))
+    let status = if result.valid {
+        StatusCode::OK
     } else {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(result).unwrap()),
-        )
-    }
+        StatusCode::BAD_REQUEST
+    };
+    (status, Json(serde_json::to_value(result).unwrap()))
 }
 
-/// Access a protected resource.
+/// Access a gated resource.
 ///
 /// Flow:
 /// 1. Verify the ZK proof
-/// 2. Check for x402 payment header
-/// 3. If no payment header → return 402 with payment requirements
-/// 4. If payment header present → verify payment via facilitator
-/// 5. If both valid → return protected content
+/// 2. If no X-Payment header → return 402 with x402 payment requirements
+/// 3. Otherwise verify the payment via the configured facilitator
+/// 4. If both succeed, return the gated content
 async fn access_resource(
+    State(cfg): State<Arc<Config>>,
     headers: HeaderMap,
-    Json(req): Json<AccessRequest>,
+    Json(req): Json<ProofRequest>,
 ) -> impl IntoResponse {
-    // Step 1: Verify ZK proof
+    // Step 1: ZK proof
     let proof_result = proof::verify_commitment(&req.proof);
     if !proof_result.valid {
         return (
@@ -119,32 +112,25 @@ async fn access_resource(
         );
     }
 
-    // Step 2: Check for x402 payment header
-    let payment_header = headers
-        .get("X-Payment")
-        .and_then(|v| v.to_str().ok());
+    // Step 2: x402 payment header
+    let payment_header = headers.get("X-Payment").and_then(|v| v.to_str().ok());
 
     match payment_header {
         None => {
-            // Return 402 Payment Required with x402 payment info
-            let payment_req = x402::payment_required_response(
-                "Access to ZK-verified resource",
-                "1000000", // 0.1 XLM in stroops
-                "GDQOE23CFSUMSVQK4Y5JHPPYK73VYCNHZHA7ENKCV37P6SUEO6XQBKPP", // testnet recipient
-            );
+            let payment_req = x402::payment_required_response(&cfg);
             (
                 StatusCode::PAYMENT_REQUIRED,
                 Json(serde_json::json!({
                     "error": "Payment required",
                     "proof_status": "valid",
                     "x402": payment_req,
-                    "hint": "Your proof is valid. Now include an X-Payment header with a signed x402 payment to access the resource."
+                    "hint": "Your proof is valid. Include an X-Payment header with a signed x402 payment to access the resource."
                 })),
             )
         }
         Some(payment) => {
-            // Step 3: Verify payment via facilitator
-            let payment_result = x402::verify_payment(payment).await;
+            // Step 3: verify payment
+            let payment_result = x402::verify_payment(&cfg, payment).await;
 
             if !payment_result.valid {
                 return (
@@ -158,12 +144,15 @@ async fn access_resource(
                 );
             }
 
-            // Step 4: Both valid — return protected content
+            // Step 4: gated content
             let resource = ProtectedResource {
                 id: Uuid::new_v4().to_string(),
-                content: "This is ZK-gated content. You proved knowledge of a secret and paid via x402 on Stellar. No identity revealed, no data exposed — just math and micropayments.".to_string(),
+                content: "ZK-gated resource unlocked. The agent proved knowledge of a secret credential and settled a micropayment on Stellar. No identity, no credential contents — only cryptographic attestation and settlement.".to_string(),
                 verified_by: "proofpay".to_string(),
-                payment_status: format!("settled via x402 (tx: {})", payment_result.tx_hash.unwrap_or_default()),
+                payment_status: format!(
+                    "settled via x402 (tx: {})",
+                    payment_result.tx_hash.unwrap_or_default()
+                ),
             };
 
             (StatusCode::OK, Json(serde_json::to_value(resource).unwrap()))
@@ -171,23 +160,21 @@ async fn access_resource(
     }
 }
 
-/// Get x402 payment requirements for accessing protected resources.
-async fn payment_info() -> impl IntoResponse {
-    let payment_req = x402::payment_required_response(
-        "Access to ZK-verified resource",
-        "1000000",
-        "GDQOE23CFSUMSVQK4Y5JHPPYK73VYCNHZHA7ENKCV37P6SUEO6XQBKPP",
-    );
+/// Return the x402 payment requirements and agent-facing instructions.
+async fn payment_info(State(cfg): State<Arc<Config>>) -> impl IntoResponse {
+    let payment_req = x402::payment_required_response(&cfg);
 
     Json(serde_json::json!({
         "x402": payment_req,
         "instructions": {
-            "1": "Generate a commitment proof: SHA-256 hash your secret, sign with Ed25519",
-            "2": "Verify your proof: POST /verify with your proof",
-            "3": "Get a signed x402 payment from your Stellar wallet",
-            "4": "Access the resource: POST /access with proof + X-Payment header"
+            "1": "Generate a commitment: SHA-256 hash of your secret credential",
+            "2": "Sign the commitment with an Ed25519 key the agent controls",
+            "3": "POST /verify to confirm the proof is accepted",
+            "4": "Build an x402 payment on Stellar and include it as X-Payment header",
+            "5": "POST /access with the proof and the X-Payment header"
         },
-        "network": "stellar:testnet",
-        "facilitator": "OpenZeppelin Channels (testnet)"
+        "network": cfg.network,
+        "facilitator": cfg.facilitator_url,
+        "mock_mode": cfg.mock_payments
     }))
 }

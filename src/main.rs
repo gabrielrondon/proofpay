@@ -1,17 +1,29 @@
-mod proof;
-mod server;
-mod x402;
+use std::sync::Arc;
+
+use proofpay::{config::Config, server};
 
 #[tokio::main]
 async fn main() {
+    // Load .env if present — silent if the file does not exist.
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt::init();
 
-    let addr = "0.0.0.0:3402";
-    tracing::info!("ProofPay starting on {}", addr);
+    let config = Arc::new(Config::from_env());
+    tracing::info!(
+        bind = %config.bind_addr,
+        network = %config.network,
+        mock = config.mock_payments,
+        "ProofPay starting"
+    );
 
-    let app = server::create_router();
+    let app = server::create_router(config.clone());
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    tracing::info!("ProofPay ready — ZK-gated payments on Stellar");
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
+        .await
+        .expect("failed to bind address");
+    tracing::info!("ProofPay ready — ZK-gated x402 access on Stellar");
+    axum::serve(listener, app)
+        .await
+        .expect("server error");
 }
